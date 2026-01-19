@@ -76,6 +76,74 @@ Not licensed under MIT. Demo/listening only. No reuse/redistribution without per
       pointer-events: none;
       transform: translateY(20px);
     }
+    /* Default hidden state for startup */
+    #ui {
+      display: none;
+    }
+    #ui.visible {
+      display: flex;
+    }
+
+    /* Setup Modal */
+    #setup-modal {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 300;
+      display: flex; /* Flex by default, JS will hide it */
+      align-items: center;
+      justify-content: center;
+      backdrop-filter: blur(10px);
+    }
+
+    .setup-content {
+      background: rgba(18, 18, 20, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      padding: 40px;
+      max-width: 500px;
+      text-align: center;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    }
+
+    .setup-title {
+      font-size: 24px;
+      color: #fff;
+      margin-bottom: 16px;
+      font-weight: 300;
+      letter-spacing: 0.05em;
+    }
+
+    .setup-desc {
+      font-family: 'Space Mono', monospace;
+      font-size: 11px;
+      color: rgba(255,255,255,0.6);
+      line-height: 1.6;
+      margin-bottom: 30px;
+    }
+
+    .setup-btn {
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.15), rgba(255, 255, 255, 0.05));
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #fff;
+      padding: 14px 28px;
+      border-radius: 12px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.3s;
+      font-family: 'Space Mono', monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .setup-btn:hover {
+      background: rgba(255, 255, 255, 0.25);
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+    }
 
     .tabs {
       display: flex;
@@ -415,6 +483,18 @@ Not licensed under MIT. Demo/listening only. No reuse/redistribution without per
     <div id="note-display" style="font-size:9px;opacity:0.65;">Note: --</div>
     <div id="bar-display" style="font-size:9px;opacity:0.65;">Bar: --</div>
     <div id="rec-indicator">REC</div>
+  </div>
+
+  <div id="setup-modal">
+    <div class="setup-content">
+      <div class="setup-title">Welcome to Geometric Resonance</div>
+      <div class="setup-desc">
+        To enable presets, auto-saving, and custom Milkdrop files, please select a folder on your computer to store these files.
+        <br><br>
+        We recommend creating a new folder named <strong>"Visualizer"</strong> in your Documents.
+      </div>
+      <button class="setup-btn" id="setup-folder-btn">Select Folder & Begin</button>
+    </div>
   </div>
 
   <!--
@@ -1238,6 +1318,336 @@ Not licensed under MIT. Demo/listening only. No reuse/redistribution without per
     const fillLight = new THREE.PointLight(0x4488ff, 0.4, 80);
     fillLight.position.set(-15, -10, -20);
     scene.add(fillLight);
+    // ==========================================
+    // PERSISTENCE SYSTEM (File System Access API)
+    // ==========================================
+    const persistence = {
+      dirHandle: null,
+      handles: { presets: null, butterchurn: null, current: null },
+      needsSave: false,
+      lastSaveTime: 0,
+      
+      async init() {
+        // Try to recover handle from IndexedDB
+        try {
+          const db = await this.openDB();
+          const handle = await this.getHandle(db);
+          if (handle) {
+            // Verify permission
+            const perm = await handle.queryPermission({ mode: 'readwrite' });
+            if (perm === 'granted') {
+              this.dirHandle = handle;
+              await this.setupFolders();
+              await this.loadSettings();
+              this.hideSetup();
+              this.showUI(false); // Keep UI hidden on start as requested
+            } else {
+              // Permission prompt needed, show setup
+              this.showSetup();
+            }
+          } else {
+            this.showSetup();
+          }
+        } catch (e) {
+          console.error("Persistence init error:", e);
+          this.showSetup();
+        }
+      },
+
+      async connect() {
+        try {
+          const handle = await window.showDirectoryPicker();
+          this.dirHandle = handle;
+          
+          // Save to DB
+          const db = await this.openDB();
+          await this.putHandle(db, handle);
+
+          await this.setupFolders();
+          await this.loadSettings();
+           // Explicitly save initial settings if none existed
+          this.triggerSave();
+          
+          this.hideSetup();
+        } catch (e) {
+          console.error("Connection failed:", e);
+          alert("Could not connect to folder: " + e.message);
+        }
+      },
+
+      async setupFolders() {
+        if (!this.dirHandle) return;
+        this.handles.presets = await this.dirHandle.getDirectoryHandle('presets', { create: true });
+        this.handles.butterchurn = await this.dirHandle.getDirectoryHandle('butterchurn_presets', { create: true });
+        this.handles.current = await this.dirHandle.getDirectoryHandle('current', { create: true });
+      },
+
+      async saveSettings() {
+        if (!this.handles.current) return;
+        try {
+          const fileHandle = await this.handles.current.getFileHandle('settings.json', { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(JSON.stringify(config, null, 2));
+          await writable.close();
+          this.needsSave = false;
+          this.lastSaveTime = performance.now() / 1000;
+          console.log("Settings auto-saved.");
+        } catch (e) {
+          console.warn("Auto-save failed:", e);
+        }
+      },
+
+      async loadSettings() {
+        if (!this.handles.current) return;
+        try {
+          const fileHandle = await this.handles.current.getFileHandle('settings.json');
+          const file = await fileHandle.getFile();
+          const text = await file.text();
+          const savedConfig = JSON.parse(text);
+          Object.assign(config, savedConfig);
+          
+          // Apply loaded settings
+          applyColorTheme(); setBgPatternFromConfig(); updateTrailMode();
+          buildMainGeometry(); buildRings(); buildEnvironment(); buildShockwaves();
+          buildLightRays(); buildAurora(); buildEnergyField(); buildOrbitals();
+          
+          // Update basic UI inputs
+          const updateInput = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
+          const updateCheck = (id, val) => { const el = document.getElementById(id); if(el) el.classList.toggle('active', !!val); };
+          
+          // Refresh a few key UI elements to match config
+          updateInput('form', config.form);
+          updateInput('colorTheme', config.colorTheme);
+          updateInput('cameraMode', config.cameraMode);
+          updateCheck('toggleModelSpin', config.modelSpinEnabled);
+          // ... (full UI sync happens when opening menus, but these are main ones)
+          
+          console.log("Settings loaded.");
+        } catch (e) {
+          console.log("No saved settings found or load error, using defaults.");
+        }
+      },
+
+      triggerSave() {
+        this.needsSave = true;
+      },
+
+      showSetup() { document.getElementById('setup-modal').style.display = 'flex'; },
+      hideSetup() { document.getElementById('setup-modal').style.display = 'none'; },
+      
+      // IndexedDB Helpers (No external lib needed for simple key-val)
+      openDB() {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open('VisualizerDB', 1);
+          req.onupgradeneeded = e => e.target.result.createObjectStore('handles');
+          req.onsuccess = e => resolve(e.target.result);
+          req.onerror = e => reject(e);
+        });
+      },
+      getHandle(db) {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction('handles', 'readonly');
+          const req = tx.objectStore('handles').get('root');
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      },
+      putHandle(db, handle) {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction('handles', 'readwrite');
+          const req = tx.objectStore('handles').put(handle, 'root');
+          req.onsuccess = () => resolve();
+          req.onerror = () => reject(req.error);
+        });
+      },
+      
+      // === Preset Extensions ===
+      async listPresets() {
+          if (!this.handles.presets) return [];
+          const names = [];
+          for await (const [name, handle] of this.handles.presets.entries()) {
+              if (name.endsWith('.json')) {
+                  names.push(name.replace('.json', ''));
+              }
+          }
+          // Sort naturally
+          return names.sort((a, b) => a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'}));
+      },
+      
+      async savePreset(name, configData) {
+          if (!this.handles.presets) return;
+          try {
+              const fileHandle = await this.handles.presets.getFileHandle(`${name}.json`, { create: true });
+              const writable = await fileHandle.createWritable();
+              await writable.write(JSON.stringify(configData, null, 2));
+              await writable.close();
+              console.log(`Preset "${name}" saved.`);
+          } catch(e) {
+              console.error("Error saving preset:", e);
+              alert("Failed to save preset: " + e.message);
+          }
+      },
+      
+      async loadPreset(name) {
+          if (!this.handles.presets) return;
+          try {
+              const fileHandle = await this.handles.presets.getFileHandle(`${name}.json`);
+              const file = await fileHandle.getFile();
+              const text = await file.text();
+              const savedConfig = JSON.parse(text);
+              
+              Object.assign(config, savedConfig);
+              this.applyConfigToUI();
+              console.log(`Preset "${name}" loaded.`);
+              
+              // Show fleeting notification
+              this.showNotification(`Loaded: ${name}`);
+              
+              // Trigger autosave so we stay on this preset
+              this.triggerSave();
+          } catch(e) {
+              console.error("Error loading preset:", e);
+          }
+      },
+      
+      async deletePreset(name) {
+          if (!this.handles.presets) return;
+          try {
+              await this.handles.presets.removeEntry(`${name}.json`);
+              console.log(`Preset "${name}" deleted.`);
+          } catch(e) {
+              console.error("Error deleting preset:", e);
+          }
+      },
+      
+      async loadPresetByIndex(index) {
+          const list = await this.listPresets();
+          if (index >= 0 && index < list.length) {
+              this.loadPreset(list[index]);
+          } else {
+              this.showNotification(`Slot ${index + 1}: Empty`);
+          }
+      },
+      
+      applyConfigToUI() {
+          // 1. Update Scene Objects
+          applyColorTheme(); 
+          setBgPatternFromConfig(); 
+          updateTrailMode();
+          buildMainGeometry(); 
+          buildRings(); 
+          buildEnvironment(); 
+          buildShockwaves();
+          buildLightRays(); 
+          buildAurora(); 
+          buildEnergyField(); 
+          buildOrbitals();
+          
+          if(config.milkdropEnabled && typeof updateMilkdrop === 'function') updateMilkdrop();
+          if(config.videoEnabled && typeof startVideoLayer === 'function') startVideoLayer(); // Ensure video state matches
+
+          // 2. Sync UI Inputs (Values & Toggles)
+          // Helper to safely update value inputs
+          const setVal = (id, val) => { 
+             const el = document.getElementById(id); 
+             if(el) { el.value = val; }
+          };
+          // Helper to safely update toggles (active class)
+          const setToggle = (id, isActive) => {
+             const el = document.getElementById(id);
+             if(el) el.classList.toggle('active', !!isActive);
+          };
+
+          // --- General ---
+          setVal('form', config.form);
+          setVal('colorTheme', config.colorTheme);
+          setVal('cameraMode', config.cameraMode);
+          setVal('particleMode', config.particleMode);
+          setVal('trailMode', config.trailMode);
+          setVal('environment', config.environment);
+          setVal('bgPattern', config.bgPattern);
+          
+          // --- Physics & FX ---
+          setVal('bloomStrength', config.bloomStrength);
+          setVal('bloomRadius', config.bloomRadius);
+          setVal('glitchAmount', config.glitchAmount);
+          setVal('vignette', config.vignette);
+          setVal('grain', config.grain);
+          setVal('aberration', config.aberration);
+          setVal('bgPatternStrength', config.bgPatternStrength);
+          
+          // --- Model Motion ---
+          setToggle('toggleModelSpin', config.modelSpinEnabled);
+          setToggle('toggleModelSpinReactive', config.modelSpinReactive);
+          setToggle('toggleModelPulse', config.modelPulseEnabled); // Assuming this ID exists or should
+          setVal('modelSpinSpeed', config.modelSpinSpeed);
+          setVal('modelSpinAxis', config.modelSpinAxis);
+          setVal('modelSpinReactivity', config.modelSpinReactivity);
+          setVal('modelPulseAmount', config.modelPulseAmount);
+
+          // --- Milkdrop ---
+          setToggle('toggleMilkdrop', config.milkdropEnabled);
+          setVal('milkdropOpacity', config.milkdropOpacity);
+          setVal('milkdropBlendMode', config.milkdropBlendMode);
+          setToggle('toggleMilkdropLumaKey', config.milkdropLumaKey);
+          setVal('milkdropLumaThreshold', config.milkdropLumaThreshold);
+          setVal('milkdropLumaSmooth', config.milkdropLumaSmooth);
+
+          // --- Visibility Toggles ---
+          setToggle('toggleWaveform', config.showWaveform);
+          setToggle('toggleBars', config.showBars);
+          setToggle('toggleConnections', config.showConnections);
+          setToggle('toggleParticles', config.showParticles);
+          setToggle('toggleShockwaves', config.showShockwaves);
+          setToggle('toggleLightRays', config.showLightRays);
+          setToggle('toggleAurora', config.showAurora);
+          setToggle('toggleEnergyField', config.showEnergyField);
+          setToggle('toggleOrbitals', config.showOrbitals);
+          setToggle('toggleSpectrum', config.showSpectrum);
+          setToggle('toggleAutoPilot', config.autoPilot);
+          setToggle('toggleBeatFlash', config.beatFlash);
+          setToggle('toggleColorCycle', config.colorCycle);
+          setToggle('toggleSynesthesia', config.synesthesia);
+          setToggle('toggleHarmonicSnap', config.harmonicSnap);
+          setToggle('toggleNegativeSpace', config.negativeSpace);
+          setToggle('toggleReactiveBg', config.reactiveBg);
+          
+          // --- Video ---
+          setToggle('toggleVideoLayer', config.videoEnabled);
+          setVal('videoOpacity', config.videoOpacity);
+          setVal('videoBlendMode', config.videoBlendMode);
+          // (Add others if needed)
+
+          console.log("UI synced to config:", config);
+      },
+      
+      showNotification(msg) {
+          let notif = document.getElementById('notif-overlay');
+          if (!notif) {
+              notif = document.createElement('div');
+              notif.id = 'notif-overlay';
+              notif.style.cssText = 'position:fixed;top:20px;right:20px;background:rgba(0,0,0,0.7);color:white;padding:10px 20px;border-radius:4px;pointer-events:none;font-family:monospace;transition:opacity 0.3s;z-index:1000;';
+              document.body.appendChild(notif);
+          }
+          notif.innerText = msg;
+          notif.style.opacity = '1';
+          clearTimeout(this.notifTimer);
+          this.notifTimer = setTimeout(() => { notif.style.opacity = '0'; }, 2000);
+      },
+      
+      showUI(show) {
+          const ui = document.getElementById('ui');
+          if (show) {
+              ui.style.display = 'flex';
+              requestAnimationFrame(() => ui.classList.remove('hidden'));
+          } else {
+              ui.classList.add('hidden');
+              // Wait for transition if needed, or just set display none
+               setTimeout(() => { if(ui.classList.contains('hidden')) ui.style.display = 'none'; }, 600);
+          }
+      }
+    };
+
     // Audio Analyzer - Enhanced with better frequency mapping and transient detection
     // Audio Analyzer - Enhanced with better frequency mapping and transient detection
     /*
@@ -3004,76 +3414,84 @@ uFilmLook: { value: 0 }, uBeatPulse: { value: 0 }, uGlitch: { value: 0 },
     const getFFTInterval = () => 1000 / (60 - config.smoothness * 30); // 60fps to 30fps
     const _pool = { tmp: new THREE.Vector3(), targetPos: new THREE.Vector3(), axisY: new THREE.Vector3(0, 1, 0), quat: new THREE.Quaternion(), vi: new THREE.Vector3(), vj: new THREE.Vector3() };
 
-    // Presets
-    let presets = {};
-    try { presets = JSON.parse(localStorage.getItem('geometricResonancePresets') || '{}'); } catch (e) { }
-    window.openPresetModal = () => { document.getElementById('preset-modal').style.display = 'block'; renderPresetList(); };
+    // Presets - File Based System (Replaces localStorage)
+    window.openPresetModal = () => { 
+        document.getElementById('preset-modal').style.display = 'block'; 
+        if(persistence.dirHandle) renderPresetList(); 
+        else alert("Please connect a folder first via the main setup.");
+    };
     window.closePresetModal = () => { document.getElementById('preset-modal').style.display = 'none'; };
-    window.savePreset = () => {
+    
+    window.savePreset = async () => {
       const name = document.getElementById('preset-name').value.trim();
       if (!name) return;
-      presets[name] = JSON.parse(JSON.stringify(config));
-      localStorage.setItem('geometricResonancePresets', JSON.stringify(presets));
-      renderPresetList();
+      if (persistence && persistence.dirHandle) {
+          await persistence.savePreset(name, config);
+          renderPresetList();
+      } else {
+          alert("Persistence not initialized.");
+      }
     };
-    window.loadPreset = (name) => {
-      if (!presets[name]) return;
-      Object.assign(config, presets[name]);
-      // Update UI elements (especially new model motion controls) to reflect the loaded preset
-      const setToggle = (id, on) => {
-        const el = document.getElementById(id);
-        if (el) el.classList.toggle('active', !!on);
-      };
-      const setVal = (id, v) => {
-        const el = document.getElementById(id);
-        if (el && typeof v !== 'undefined' && v !== null) el.value = v;
-      };
-
-      // Common selects
-      setVal('form', config.form);
-      setVal('colorTheme', config.colorTheme);
-      setVal('cameraMode', config.cameraMode);
-      setVal('particleMode', config.particleMode);
-      setVal('trailMode', config.trailMode);
-      setVal('environment', config.environment);
-      setVal('bgPattern', config.bgPattern);
-
-      // Model motion controls
-      setToggle('toggleModelSpin', config.modelSpinEnabled);
-      setToggle('toggleModelSpinReactive', config.modelSpinReactive);
-      setToggle('toggleModelPulse', config.modelPulseEnabled);
-      setVal('modelSpinSpeed', config.modelSpinSpeed);
-      setVal('modelSpinAxis', config.modelSpinAxis);
-      setVal('modelSpinReactivity', config.modelSpinReactivity);
-      setVal('modelPulseAmount', config.modelPulseAmount);
-
-      applyColorTheme(); setBgPatternFromConfig(); updateTrailMode();
-      buildMainGeometry(); buildRings(); buildEnvironment(); buildShockwaves();
-      buildLightRays(); buildAurora(); buildEnergyField(); buildOrbitals();
-      scene.fog.density = config.fogDensity;
-      camera.fov = config.cameraFov; camera.updateProjectionMatrix();
-      closePresetModal();
+    
+    window.loadPreset = async (name) => {
+       if (persistence && persistence.dirHandle) {
+           await persistence.loadPreset(name);
+           closePresetModal();
+       }
     };
-    window.deletePreset = (name) => { delete presets[name]; localStorage.setItem('geometricResonancePresets', JSON.stringify(presets)); renderPresetList(); };
-    function renderPresetList() {
-      const list = document.getElementById('preset-list'); list.innerHTML = '';
-      Object.keys(presets).forEach(name => {
+    
+    window.deletePreset = async (name) => {
+        if(confirm('Delete preset "' + name + '"?')) {
+            await persistence.deletePreset(name);
+            renderPresetList();
+        }
+    };
+
+    async function renderPresetList() {
+      const list = document.getElementById('preset-list'); 
+      list.innerHTML = 'Loading...';
+      if (!persistence || !persistence.dirHandle) {
+          list.innerHTML = 'No folder connected.';
+          return;
+      }
+      
+      const presets = await persistence.listPresets();
+      list.innerHTML = '';
+      
+      if (presets.length === 0) {
+          list.innerHTML = '<div style="opacity:0.5;padding:10px;">No presets found.</div>';
+          return;
+      }
+
+      presets.forEach(name => {
         const item = document.createElement('div');
-        item.style.cssText = 'padding:10px;background:rgba(255,255,255,0.03);border-radius:8px;margin-bottom:8px;cursor:pointer;color:rgba(255,255,255,0.7);display:flex;justify-content:space-between;';
-        item.innerHTML = `<span onclick="loadPreset('${name}')">${name}</span><span style="color:rgba(255,100,100,0.6);cursor:pointer;" onclick="deletePreset('${name}')">✕</span>`;
+        item.style.cssText = 'padding:10px;background:rgba(255,255,255,0.03);border-radius:8px;margin-bottom:8px;cursor:pointer;color:rgba(255,255,255,0.7);display:flex;justify-content:space-between;align-items:center;';
+        
+        const nameSpan = document.createElement('span');
+        nameSpan.innerText = name;
+        nameSpan.onclick = () => window.loadPreset(name);
+        
+        const delSpan = document.createElement('span');
+        delSpan.innerText = '✕';
+        delSpan.style.cssText = 'color:rgba(255,100,100,0.6);cursor:pointer;padding:5px;';
+        delSpan.onclick = (e) => { e.stopPropagation(); window.deletePreset(name); };
+        
+        item.appendChild(nameSpan);
+        item.appendChild(delSpan);
         list.appendChild(item);
       });
     }
 
     function randomize() {
-      const forms = ['icosahedron', 'octahedron', 'dodecahedron', 'torus', 'torusKnot', 'sphere', 'mobius', 'gyroid', 'hopfFibration', 'seashell'];
+      const forms = ['icosahedron', 'octahedron', 'dodecahedron', 'torus', 'torusKnot', 'sphere', 'mobius', 'gyroid', 'hopfFibration', 'seashell', 'diniSurface', 'cliffordTorus', 'hyperboloid', 'kleinBottle'];
       const themes = Object.keys(colorThemes);
       const cameras = ['orbit', 'reactive', 'cinematic', 'spiral', 'figure8', 'vortex', 'pendulum'];
       const particles = ['vertex', 'swarm', 'explode', 'orbital', 'magnetic', 'wave', 'vortex', 'aurora'];
-      const trails = ['none', 'light', 'medium', 'heavy', 'smear'];
-      const envs = ['void', 'stars', 'nebula', 'grid'];
-      const patterns = ['none', 'mandala', 'lattice', 'plasma', 'voronoi', 'waves'];
+      const trails = ['none', 'light', 'medium', 'heavy', 'smear', 'feedback'];
+      const envs = ['void', 'stars', 'nebula', 'grid', 'dodeca'];
+      const patterns = ['none', 'mandala', 'lattice', 'plasma', 'voronoi', 'waves', 'hexa', 'circuit'];
 
+      // Basic Visuals
       config.form = forms[Math.floor(Math.random() * forms.length)];
       config.density = Math.floor(Math.random() * 4) + 1;
       config.colorTheme = themes[Math.floor(Math.random() * themes.length)];
@@ -3082,29 +3500,80 @@ uFilmLook: { value: 0 }, uBeatPulse: { value: 0 }, uGlitch: { value: 0 },
       config.trailMode = trails[Math.floor(Math.random() * trails.length)];
       config.environment = envs[Math.floor(Math.random() * envs.length)];
       config.bgPattern = patterns[Math.floor(Math.random() * patterns.length)];
-      config.symmetry = [3, 4, 6, 8, 12][Math.floor(Math.random() * 5)];
+      
+      // Physics & Motion
+      config.symmetry = [3, 4, 6, 8, 12, 16][Math.floor(Math.random() * 6)];
       config.sensitivity = 0.6 + Math.random() * 1.8;
-      config.turbulence = Math.random() * 1.5;
+      config.turbulence = 0.2 + Math.random() * 1.3;
+      config.cohesion = 0.2 + Math.random() * 0.6;
+      
+      // Effects
       config.bloomStrength = 0.4 + Math.random() * 1.2;
+      config.glitchAmount = Math.random() > 0.85 ? Math.random() * 0.4 : 0; // Rare glitch
       config.cameraSpeed = 0.3 + Math.random() * 1.2;
-      config.cameraShake = Math.random() * 1.0;
+      config.cameraShake = Math.random() * 0.8;
       config.bgPatternStrength = 0.1 + Math.random() * 0.5;
-      config.showLightRays = Math.random() > 0.7;
+      
+      // Visibility toggles (weighted probability)
+      config.showLightRays = Math.random() > 0.6;
       config.showAurora = Math.random() > 0.7;
       config.showEnergyField = Math.random() > 0.8;
       config.showOrbitals = Math.random() > 0.7;
+      config.showShockwaves = Math.random() > 0.5;
+      config.showRimGlow = Math.random() > 0.3; // Mostly on
+      config.showWireframeCore = Math.random() > 0.2; // Mostly on
+
+      // Model Spin Randomization
+      const axes = ['x', 'y', 'z', 'xy', 'xz', 'yz', 'xyz'];
+      config.modelSpinEnabled = Math.random() > 0.3; // 70% chance enabled
+      config.modelSpinSpeed = 0.5 + Math.random() * 2.0;
+      config.modelSpinAxis = axes[Math.floor(Math.random() * axes.length)];
+      config.modelSpinReactive = Math.random() > 0.4;
+      config.modelSpinReactivity = 0.5 + Math.random() * 1.5;
+      config.modelPulseEnabled = Math.random() > 0.3;
+
+      // Milkdrop Randomization (if loaded)
+      if (Math.random() > 0.6 && window.butterchurnPresets) {
+         config.milkdropEnabled = true;
+         config.milkdropOpacity = 0.3 + Math.random() * 0.5;
+         config.milkdropBlendMode = ['add', 'screen', 'overlay'][Math.floor(Math.random() * 3)];
+         
+         // Pick random bundled preset
+         const presets = window.butterchurnPresets.getPresets();
+         const keys = Object.keys(presets);
+         if (keys.length > 0) {
+             const randomKey = keys[Math.floor(Math.random() * keys.length)];
+             loadMilkdropPreset(randomKey); 
+         }
+      } else {
+         // Keep existing state or turn off? Let's turn off 50% of the time if not triggered above
+         if (Math.random() > 0.7) config.milkdropEnabled = false;
+      }
 
       applyColorTheme(); setBgPatternFromConfig(); updateTrailMode();
       buildMainGeometry(); buildRings(); buildEnvironment(); buildShockwaves();
       buildLightRays(); buildAurora(); buildEnergyField(); buildOrbitals();
 
-      document.getElementById('form').value = config.form;
-      document.getElementById('colorTheme').value = config.colorTheme;
-      document.getElementById('cameraMode').value = config.cameraMode;
-      document.getElementById('particleMode').value = config.particleMode;
-      document.getElementById('trailMode').value = config.trailMode;
-      document.getElementById('environment').value = config.environment;
-      document.getElementById('bgPattern').value = config.bgPattern;
+      // UI Updates (Sync Inputs)
+      const updateInput = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
+      const updateCheck = (id, val) => { const el = document.getElementById(id); if(el) el.classList.toggle('active', !!val); }; // Toggle logic assumes 'active' class used for styling checkboxes
+
+      updateInput('form', config.form);
+      updateInput('colorTheme', config.colorTheme);
+      updateInput('cameraMode', config.cameraMode);
+      updateInput('particleMode', config.particleMode);
+      updateInput('trailMode', config.trailMode);
+      updateInput('environment', config.environment);
+      updateInput('bgPattern', config.bgPattern);
+      
+      // Update Model Spin UI
+      updateCheck('toggleModelSpin', config.modelSpinEnabled);
+      updateCheck('toggleModelSpinReactive', config.modelSpinReactive);
+      updateInput('modelSpinSpeed', config.modelSpinSpeed);
+      updateInput('modelSpinAxis', config.modelSpinAxis);
+      
+      // Trigger auto-save
+      if (typeof persistence !== 'undefined') persistence.triggerSave();
     }
     // Animation loop
     /*
@@ -3203,7 +3672,13 @@ uFilmLook: { value: 0 }, uBeatPulse: { value: 0 }, uGlitch: { value: 0 },
       bgUniforms.uPatternStrength.value = config.bgPatternStrength;
 
       if (config.videoEnabled) updateVideoUniforms();
+      if (config.videoEnabled) updateVideoUniforms();
       if (config.milkdropEnabled) updateMilkdrop();
+      
+      // Auto-save debouncer logic
+      if (persistence.needsSave && (t - persistence.lastSaveTime) > 2.0) {
+         persistence.saveSettings();
+      }
 
       // Main geometry - USE MOTION COORDINATOR for scale (single source of truth)
       if (wireframeMesh && particleSystem) {
@@ -3900,17 +4375,54 @@ screenFXPass.uniforms.uNegative.value = config.negativeSpace ? 1.0 : 0.0;
     document.addEventListener('keydown', e => {
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       switch (e.key.toLowerCase()) {
-        case ' ': e.preventDefault(); playBtn.click(); break;
-        case 'u': document.getElementById('ui').classList.toggle('hidden'); break;
-        case 'r': randomize(); break;
+        case ' ': { e.preventDefault(); playBtn.click(); break; }
+        case 'u': {
+            const ui = document.getElementById('ui');
+            const isHidden = ui.style.display === 'none' || ui.classList.contains('hidden');
+            persistence.showUI(isHidden);
+            break;
+        }
+        case 'r': { randomize(); break; }
         case 'f': document.getElementById('fullscreenBtn').click(); break;
         case 'p': openPresetModal(); break;
-        case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8':
-          const tabs = document.querySelectorAll('.tab');
-          const idx = parseInt(e.key) - 1;
-          if (tabs[idx]) tabs[idx].click();
+        case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9': case '0': {
+          // Check for Hotkeys when UI is hidden
+          const uiEl = document.getElementById('ui');
+          const isHidden = uiEl.style.display === 'none' || uiEl.classList.contains('hidden');
+          
+          if (isHidden) {
+             // Load Preset by Index (0-9)
+             const key = e.key;
+             let index = parseInt(key) - 1;
+             if (key === '0') index = 9;
+             
+             if (persistence) persistence.loadPresetByIndex(index);
+          } else {
+              // Existing Tab Logic (only 1-8 used there)
+              if (e.key !== '9' && e.key !== '0') {
+                  const tabs = document.querySelectorAll('.tab');
+                  const idx = parseInt(e.key) - 1;
+                  if (tabs[idx]) tabs[idx].click();
+              }
+          }
           break;
+        }
       }
+    });
+
+    // Numpad support
+    document.addEventListener('keydown', e => {
+        if (e.code.startsWith('Numpad')) {
+             const key = e.key; // "0"..."9"
+             const uiEl = document.getElementById('ui');
+             const isHidden = uiEl.style.display === 'none' || uiEl.classList.contains('hidden');
+             
+             if (isHidden && /^[0-9]$/.test(key)) {
+                 let index = parseInt(key) - 1;
+                 if (key === '0') index = 9;
+                 if (persistence) persistence.loadPresetByIndex(index);
+             }
+        }
     });
 
     // Resize
@@ -3923,6 +4435,40 @@ screenFXPass.uniforms.uNegative.value = config.negativeSpace ? 1.0 : 0.0;
       screenFXPass.uniforms.uResolution.value.set(w, h);
       specCanvas.width = w;
     });
+
+
+
+    document.getElementById('setup-folder-btn').addEventListener('click', () => persistence.connect());
+    
+    // Hook into config changes for auto-save
+    // We'll use a Proxy to detect changes to 'config'
+    const configProxy = new Proxy(config, {
+      set(target, prop, value) {
+        target[prop] = value;
+        persistence.triggerSave();
+        return true;
+      }
+    });
+    // Replace the global config reference where possible, 
+    // BUT 'config' is const. We can't reassign it. 
+    // Instead, we will manually call persistence.triggerSave() in update listeners 
+    // OR just use a periodic check or wrapper. 
+    // Since 'config' is const, we'll add a dirty listener helper.
+    
+    function markConfigDirty() { persistence.triggerSave(); }
+    
+    // Attach to all UI inputs
+    document.querySelectorAll('input, select').forEach(el => {
+       el.addEventListener('change', markConfigDirty);
+       el.addEventListener('input', markConfigDirty);
+    });
+    document.querySelectorAll('.toggle').forEach(el => {
+       el.addEventListener('click', markConfigDirty);
+    });
+
+    // Initialize
+    persistence.init();
+
   </script>
 </body>
 
